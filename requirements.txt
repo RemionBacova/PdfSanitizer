@@ -1,0 +1,6 @@
+# pikepdf bundles libqpdf in its manylinux wheel, so there are no system packages to install.
+# Licensing matters here: pikepdf is MPL-2.0 and libqpdf is Apache-2.0, both permissive.
+# Ghostscript and MuPDF were rejected for this job because both are AGPL.
+pikepdf==10.13.0.post1
+Flask==3.1.2
+gunicorn==23.0.0

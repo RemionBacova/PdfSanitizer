@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+libs/
+README.md
+*.sh
