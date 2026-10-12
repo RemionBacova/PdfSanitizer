@@ -51,9 +51,10 @@ GET /health
 
 Callers must fail closed: treat any non-200 as a refusal and never fall back to the original.
 
-The service is private (`--no-allow-unauthenticated`): Cloud Run lets a request through only
+The service is private: Cloud Run lets a request through only
 with a Google token from an identity allowed to invoke it (the API sends one), and the app
-then checks `X-Api-Key`. A request without a token gets 403 from Cloud Run itself.
+then checks `X-Api-Key`. A request without a token gets 403 from Cloud Run itself. `deploy.sh` passes no
+`--allow-unauthenticated` flag either way, so a deploy leaves the service's access as it is.
 
 ## Environment
 
