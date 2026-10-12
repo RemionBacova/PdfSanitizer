@@ -18,7 +18,7 @@ gcloud run deploy "$SERVICE" \
   --region "$REGION" \
   --source . \
   --platform managed \
-  --allow-unauthenticated \
+  --no-allow-unauthenticated \
   --set-env-vars "API_KEYS=${API_KEYS},MAX_BYTES=10485760,MAX_PAGES=20" \
   --memory 512Mi \
   --cpu 1 \
