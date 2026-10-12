@@ -12,20 +12,29 @@ result is then re-parsed and refused if anything dangerous is still reachable. T
 rebuild without checking it would be the weak point, so the check is the actual control.
 """
 
+import base64
 import hmac
 import io
 import logging
 import os
+import zlib
 
 import pikepdf
 from flask import Flask, Response, jsonify, request
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("sanitizer")
-
 MAX_BYTES = int(os.environ.get("MAX_BYTES", 10 * 1024 * 1024))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", 20))
+
+# Looking for unused resources makes qpdf read every content stream whole into memory, and
+# Flate expands about 1000x: a 2 MB upload measured past 3 GB. This caps the decoded size of
+# all content streams together, checked before qpdf reads them. Real menus stay far below it.
+MAX_CONTENT_BYTES = int(os.environ.get("MAX_CONTENT_BYTES", 64 * 1024 * 1024))
+
+app = Flask(__name__)
+# Refuse an oversized body before reading it, including a chunked one with no Content-Length.
+app.config["MAX_CONTENT_LENGTH"] = MAX_BYTES
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("sanitizer")
 
 # Catalog entries that can carry or trigger behaviour.
 ROOT_KEYS = ("/OpenAction", "/AA", "/Names", "/AcroForm", "/Outlines", "/Metadata")
@@ -71,9 +80,100 @@ def _authenticate(provided):
     return matched
 
 
+class Refused(Exception):
+    """The document is refused before it is rebuilt; carries the JSON answer."""
+
+    def __init__(self, **answer):
+        super().__init__(answer.get("error"))
+        self.answer = answer
+
+
+def _filters(stream):
+    value = stream.get("/Filter")
+    if value is None:
+        return []
+    if isinstance(value, pikepdf.Array):
+        return [str(f) for f in value]
+    return [str(value)]
+
+
+def _ascii85(raw):
+    body = raw.split(b"~>", 1)[0]
+    return base64.a85decode(body, ignorechars=b" \t\n\r\f\v\0")
+
+
+def _ascii_hex(raw):
+    digits = bytes(c for c in raw.split(b">", 1)[0] if c not in b" \t\n\r\f\0")
+    if len(digits) % 2:
+        digits += b"0"
+    return bytes.fromhex(digits.decode("ascii"))
+
+
+_TEXT_DECODERS = {"/ASCII85Decode": _ascii85, "/ASCIIHexDecode": _ascii_hex}
+
+
+def _content_streams(pdf):
+    """Every stream qpdf parses as page content: page contents, form XObjects and tiling
+    patterns. Found by type across the whole file so inherited resources are not missed."""
+    for page in pdf.pages:
+        contents = page.obj.get("/Contents")
+        if isinstance(contents, pikepdf.Stream):
+            yield contents
+        elif isinstance(contents, pikepdf.Array):
+            yield from (c for c in contents if isinstance(c, pikepdf.Stream))
+    for obj in pdf.objects:
+        if isinstance(obj, pikepdf.Stream) and (
+            obj.get("/Subtype") == pikepdf.Name.Form or obj.get("/PatternType") == 1
+        ):
+            yield obj
+
+
+def _check_content_size(pdf):
+    """Decode content streams just far enough to know they fit in MAX_CONTENT_BYTES, a megabyte
+    at a time and discarding the output, so the check itself never holds the expansion."""
+    seen = set()
+    total = 0
+    for stream in _content_streams(pdf):
+        if stream.objgen in seen:
+            continue
+        seen.add(stream.objgen)
+        filters = _filters(stream)
+        raw = stream.read_raw_bytes()
+        # Text encodings in front only ever shrink the data, so they are undone here first.
+        while filters and filters[0] in _TEXT_DECODERS:
+            try:
+                raw = _TEXT_DECODERS[filters[0]](raw)
+            except ValueError:
+                raise Refused(error="unreadable")
+            filters = filters[1:]
+        if not filters:
+            total += len(raw)
+        elif filters == ["/FlateDecode"]:
+            inflater = zlib.decompressobj()
+            pending = raw
+            try:
+                while pending and total <= MAX_CONTENT_BYTES:
+                    total += len(inflater.decompress(pending, 1024 * 1024))
+                    pending = inflater.unconsumed_tail
+            except zlib.error:
+                pass  # damaged data: qpdf decides what it can still read
+        else:
+            # Other filters (LZW, RunLength, chains) can expand just as far and cannot be measured
+            # here without decoding them whole. Real content streams use Flate or nothing.
+            raise Refused(error="unsupported_encoding", filters=filters)
+        if total > MAX_CONTENT_BYTES:
+            raise Refused(error="content_too_large", maxContentBytes=MAX_CONTENT_BYTES)
+
+
 def _sanitize(data):
     """Strip behaviour, rebuild, and garbage-collect anything left unreferenced."""
     with pikepdf.open(io.BytesIO(data)) as pdf:
+        # Both limits are checked before any rebuilding work is spent on the document.
+        page_count = len(pdf.pages)
+        if page_count > MAX_PAGES:
+            raise Refused(error="too_many_pages", pages=page_count, maxPages=MAX_PAGES)
+        _check_content_size(pdf)
+
         for key in ROOT_KEYS:
             if key in pdf.Root:
                 del pdf.Root[key]
@@ -85,8 +185,6 @@ def _sanitize(data):
 
         if "/Info" in pdf.trailer:
             del pdf.trailer["/Info"]
-
-        page_count = len(pdf.pages)
 
         # Drops orphaned objects so nothing dangerous lingers in the bytes even unreferenced.
         pdf.remove_unreferenced_resources()
@@ -167,12 +265,12 @@ def sanitize():
 
     try:
         cleaned, page_count = _sanitize(data)
+    except Refused as refused:
+        log.warning("refused for key=%s: %s", label, refused.answer)
+        return jsonify(**refused.answer), 422
     except Exception as exc:
         log.warning("rebuild failed for key=%s: %s", label, exc)
         return jsonify(error="unreadable"), 422
-
-    if page_count > MAX_PAGES:
-        return jsonify(error="too_many_pages", pages=page_count, maxPages=MAX_PAGES), 422
 
     threats = _find_threats(cleaned)
     if threats:

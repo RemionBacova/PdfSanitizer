@@ -42,7 +42,8 @@ POST /            X-Api-Key: <secret>      body: application/pdf
   401  bad or missing key        (checked before the body is read)
   413  over MAX_BYTES
   415  not a PDF
-  422  unreadable / too many pages / active content survived
+  422  unreadable / too many pages / content too large when decoded /
+       unsupported content encoding / active content survived
   503  API_KEYS not set
 
 GET /health
@@ -56,7 +57,8 @@ Callers must fail closed: treat any non-200 as a refusal and never fall back to 
 |---|---|---|
 | `API_KEYS` | — | `label:secret[,label:secret]`. Required; no keys means refuse everything. |
 | `MAX_BYTES` | 10485760 | |
-| `MAX_PAGES` | 20 | |
+| `MAX_PAGES` | 20 | Checked before the rebuild. |
+| `MAX_CONTENT_BYTES` | 67108864 | Decoded size of all page content streams together, measured before qpdf reads them: Flate expands ~1000x, so a 2 MB file can decode to GBs. |
 
 ## Deploy
 
